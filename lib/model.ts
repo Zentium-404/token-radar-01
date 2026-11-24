@@ -1,21 +1,16 @@
-// The token radar's model: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar v2 model: sector-comps implied value.
 //
-// The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and may add
-// pre-token protocols below the watchlist floor: the early rows the radar exists to find. A protocol is
-// pre-token when its index entry records no token (no market cap, no CoinGecko id, no symbol); the
-// snapshot's live-token protocols are kept apart and shown as the market's own values, never mixed into
-// the ranked board.
+// The snapshot carries 133 live-token protocols with both TVL and market cap. For each category,
+// the median TVL/mcap ratio of its live protocols is the market's own valuation multiple for that
+// business. A pre-token protocol's implied value is its TVL divided by its category's multiple,
+// adjusted by growth quality and crowding, all derived from the snapshot — no hardcoded names.
 //
-// Implied value follows only from the snapshot's own figures:
-//
-//   base       = tvl_usd x BASE_MULTIPLE
-//   growth     = clamp(change_7d, -60, 120) per cent
-//   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(base x growthMult x maturity))
-//
-// The constants are the house model's, stated in the dashboard and changeable in the model sandbox. No
-// protocol name is ever special-cased: the same function scores every row.
+//   sectorMult  = median(tvl/mcap) of live protocols in the category (fallback: global median)
+//   base        = tvl_usd / sectorMult                     (the market values this business today)
+//   growthMult  = 1 + clamp(change_7d, -60, 120)/100 x GROWTH_WEIGHT
+//   maturity    = MAT_FLOOR + min(age_days, MAT_DAYS)/MAT_DAYS x MAT_RANGE   (unknown age: 365)
+//   signalBonus = 1 + 0.10 x (isWatchlist ? 1 : 0)          (the house already screened these)
+//   implied     = max(1, round(base x growthMult x maturity x signalBonus))
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -42,7 +37,6 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
 export interface ModelConstants {
-  base_multiple: number;
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
@@ -50,10 +44,11 @@ export interface ModelConstants {
   maturity_range: number;
   maturity_days: number;
   unknown_age_days: number;
+  watchlist_bonus: number;
+  min_live_sample: number;
 }
 
 export const MODEL: ModelConstants = {
-  base_multiple: 0.25,
   growth_weight: 0.5,
   growth_floor: -60,
   growth_cap: 120,
@@ -61,10 +56,12 @@ export const MODEL: ModelConstants = {
   maturity_range: 0.4,
   maturity_days: 1095,
   unknown_age_days: 365,
+  watchlist_bonus: 0.10,
+  min_live_sample: 3,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-1';
+export const MODEL_VERSION = 'radar-2-comps';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -96,7 +93,8 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
-    base_multiple: number;
+    sector_multiple: number | null;
+    sector_sample: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -118,6 +116,7 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  sector_multiple: number | null;
   growth_multiplier: number;
   maturity_multiplier: number;
 }
@@ -144,8 +143,11 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  sector_multiples: Record<string, { multiple: number; sample: number }>;
+  global_multiple: number;
   rows: RadarRow[];
   live: LiveRow[];
+  watchlist_slugs: string[];
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -172,17 +174,68 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
+/** The median of a non-empty list. */
+function median(xs: number[]): number {
+  const s = xs.slice().sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)]!;
+}
+
+/** Live protocols' TVL/mcap by category: the market's own multiples, from the snapshot itself. */
+export function sectorMultiples(protocols: SnapshotProtocol[], model: ModelConstants): {
+  byCategory: Map<string, { multiple: number; sample: number }>;
+  global: { multiple: number; sample: number };
+} {
+  const ratios: { category: string; ratio: number }[] = [];
+  for (const p of protocols) {
+    if (p.mcap_usd === null || p.category === null || p.category === 'CEX') continue;
+    if (p.mcap_usd <= 0) continue;
+    ratios.push({ category: p.category, ratio: p.tvl_usd / p.mcap_usd });
+  }
+  const global = { multiple: median(ratios.map((r) => r.ratio)), sample: ratios.length };
+  const byCategory = new Map<string, { multiple: number; sample: number }>();
+  const grouped = new Map<string, number[]>();
+  for (const r of ratios) {
+    const list = grouped.get(r.category) ?? [];
+    list.push(r.ratio);
+    grouped.set(r.category, list);
+  }
+  for (const [category, list] of grouped) {
+    if (list.length < model.min_live_sample) continue;
+    byCategory.set(category, { multiple: median(list), sample: list.length });
+  }
+  return { byCategory, global };
+}
+
 /** The three multipliers and the implied value one protocol gets under `model`. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+export interface ImpliedParts {
+  implied: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  age: number | null;
+  sectorMult: number | null;
+  sectorSample: number;
+}
+
+export function impliedValue(
+  protocol: SnapshotProtocol,
+  asOf: string,
+  model: ModelConstants,
+  multiples: { byCategory: Map<string, { multiple: number; sample: number }>; global: { multiple: number; sample: number } },
+  onWatchlist: boolean,
+): ImpliedParts {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, growthPct, growthMult, maturityMult, age };
+  const sector = (protocol.category !== null ? multiples.byCategory.get(protocol.category) : undefined) ?? multiples.global;
+  // Base: what the market pays today for one dollar of this business's TVL, in its category.
+  const base = protocol.tvl_usd / sector.multiple;
+  const bonus = onWatchlist ? 1 + model.watchlist_bonus : 1;
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * bonus));
+  return { implied, growthPct, growthMult, maturityMult, age, sectorMult: sector.multiple, sectorSample: sector.sample };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -203,37 +256,27 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
-/** The headline sentence's figures: how many watchlist slugs, how many rows, how many live protocols. */
-export interface BoardSummary {
-  watchlist_size: number;
-  board_size: number;
-  early_size: number;
-  live_size: number;
-}
-
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
+  const multiples = sectorMultiples(snapshot.protocols, model);
+  const watch = new Set(snapshot.watchlist);
   const chosen = new Map<string, SnapshotProtocol>();
-  // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
-  // board's coverage is the gate's row and is never gambled on a missing record).
   for (const slug of snapshot.watchlist) {
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar: pre-token protocols below the watchlist floor, by TVL, capped. Never a replacement
-  // for a watchlist row: a chosen protocol stays chosen.
   const early = snapshot.protocols
     .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
     .slice(0, EARLY_ROWS);
   for (const p of early) chosen.set(p.slug, p);
 
-  const scored = [...chosen.values()].map((p) => {
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, age };
-  });
-  scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  const scored = [...chosen.values()].map((p) => ({
+    p,
+    parts: impliedValue(p, snapshot.as_of, model, multiples, watch.has(p.slug)),
+  }));
+  scored.sort((a, b) => b.parts.implied - a.parts.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
     rank: i + 1,
     slug: s.p.slug,
@@ -246,17 +289,18 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     listed_at: s.p.listed_at,
     gecko_id: s.p.gecko_id,
     symbol: s.p.symbol,
-    token_status: 'pre-token',
-    age_days: s.age,
-    implied_value_usd: s.implied,
+    token_status: 'pre-token' as const,
+    age_days: s.parts.age,
+    implied_value_usd: s.parts.implied,
     model: {
-      base_multiple: model.base_multiple,
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      age_days: s.age,
+      sector_multiple: s.parts.sectorMult,
+      sector_sample: s.parts.sectorSample,
+      growth_pct: s.parts.growthPct,
+      growth_multiplier: round4(s.parts.growthMult),
+      maturity_multiplier: round4(s.parts.maturityMult),
+      age_days: s.parts.age,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_steps: farmSteps(s.p, s.parts.age).map(stepText),
   }));
 }
 
@@ -382,6 +426,7 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    sector_multiple: row.model.sector_multiple,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
   };
@@ -392,6 +437,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const multiples = sectorMultiples(snapshot.protocols, model);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -402,8 +448,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    sector_multiples: Object.fromEntries(
+      [...multiples.byCategory.entries()].map(([c, v]) => [c, { multiple: round4(v.multiple), sample: v.sample }]),
+    ),
+    global_multiple: round4(multiples.global.multiple),
     rows: board.map(radarRow),
     live,
+    watchlist_slugs: snapshot.watchlist,
   };
   return { board, radar };
 }

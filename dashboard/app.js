@@ -29,11 +29,14 @@
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
   function impliedOf(row, model) {
+    var sm = row.sector_multiple || DATA.global_multiple;
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    return Math.max(1, Math.round(row.tvl_usd * model.base_multiple * growthMult * maturity));
+    var base = row.tvl_usd / sm;
+    var bonus = DATA.watchlist_slugs && DATA.watchlist_slugs.indexOf(row.slug) >= 0 ? 1 + model.watchlist_bonus : 1;
+    return Math.max(1, Math.round(base * growthMult * maturity * bonus));
   }
 
   function el(tag, attrs) {
@@ -283,13 +286,24 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var cats = Object.keys(DATA.sector_multiples || {}).sort(function (a, b) {
+      return DATA.sector_multiples[b].sample - DATA.sector_multiples[a].sample;
+    });
+    var rows = cats.slice(0, 8).map(function (c) {
+      var v = DATA.sector_multiples[c];
+      return el('tr', null, el('td', { text: c }), el('td', { class: 'num', text: String(v.multiple) }), el('td', { class: 'num', text: v.sample + ' live comps' }));
+    });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'The model reads the market\'s own valuations out of the snapshot: for each category, the median TVL-to-market-cap ratio of its live-token protocols is what buyers pay today for one dollar of that business. A pre-token protocol is priced the same way, then adjusted for growth, age and watchlist standing. No protocol name is special-cased.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x ' + m.base_multiple + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
+        'implied = round( tvl / sectorMultiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x ' + (1 + m.watchlist_bonus) + ' if watchlist )'
       ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' })
+      cats.length > 0 ? el('div', { class: 'table-wrap' }, el('table', null,
+        el('thead', null, el('tr', null, el('th', { text: 'Category' }), el('th', { text: 'TVL / market cap' }), el('th', { text: 'Sample' }))),
+        el('tbody', null, rows)
+      )) : null,
+      el('p', { class: 'sub', text: 'Categories with fewer than ' + m.min_live_sample + ' live comps fall back to the global median, ' + DATA.global_multiple + '. Age is the time since first listing; an unlisted age uses ' + m.unknown_age_days + ' days. This is an estimate from the snapshot\'s own figures, not a price.' })
     );
   }
 
@@ -315,13 +329,14 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
+        el('div', null, el('span', { text: 'Category' }), el('b', { text: row.category || 'Other' })),
+        el('div', null, el('span', { text: 'Sector multiple (TVL/mcap of live comps)' }), el('b', { class: 'num', text: row.sector_multiple ? row.sector_multiple + ' from ' + DATA.sector_multiples[row.category || '']?.sample + ' comps' : 'global median ' + DATA.global_multiple })),
+        el('div', null, el('span', { text: 'Market price of the TVL today' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd / (row.sector_multiple || DATA.global_multiple)) })),
+        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) + ' (x' + row.growth_multiplier + ')' })),
+        el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) + ' (x' + row.maturity_multiplier + ')' })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate from live-market comps, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
